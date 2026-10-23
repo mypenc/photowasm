@@ -764,46 +764,32 @@ fn selective_from(d: &Descriptor) -> Option<Value> {
 }
 
 fn selective_to(p: &Value) -> Option<Descriptor> {
-    // Each range, as the command reads it (`adjust_cmds::selective_from_params`): the array form
-    // `"reds": [c, m, y, k]` first, then the scalar form, which names one range in `"colors"` and
-    // gives the channels it changes. Writing only the arrays dropped the scalar form's values, and
-    // the step exported as an adjustment that changes nothing (#7672).
-    let mut rows: Vec<Option<[f64; 4]>> = vec![None; SELECTIVE_RANGES.len()];
-    for (row, (_, name)) in rows.iter_mut().zip(SELECTIVE_RANGES) {
-        if let Some(a) = p.get(*name).and_then(Value::as_array) {
-            let v = |i: usize| a.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-            *row = Some([v(0), v(1), v(2), v(3)]);
-        }
-    }
-    if let Some(named) = jstr(p, "colors") {
-        let i = SELECTIVE_RANGES.iter().position(|(_, name)| *name == named)?;
-        let row = rows.get_mut(i)?;
-        let mut v = row.unwrap_or([0.0; 4]);
-        for (slot, key) in v.iter_mut().zip(["cyan", "magenta", "yellow", "black"]) {
-            // A channel that is given but is not a number is an error in the command
-            // (`adjust_cmds::selective_from_params`), so a step carrying one cannot be written
-            // either: ignoring it would export a different adjustment than the one recorded.
-            // `null` counts as absent there, and so here.
-            match p.get(key) {
-                None | Some(Value::Null) => {}
-                Some(_) => *slot = jnum(p, key)?,
-            }
-        }
-        *row = Some(v);
-    }
+    // Match command execution: scalar components override only the selected range, `relative`
+    // takes precedence over `method`, and invalid values must not become a different edit.
+    let photocraft_doc::Adjustment::SelectiveColor { relative, adjustments } = crate::adjust_cmds::selective_from_params(p, None).ok()? else {
+        return None;
+    };
     let mut list = Vec::new();
-    for (row, (ps, _)) in rows.iter().zip(SELECTIVE_RANGES) {
-        if let Some(v) = row {
+    for (name, row) in crate::adjust_cmds::RANGES.into_iter().zip(adjustments) {
+        if p.get(name).is_some_and(|v| !v.is_null()) || jstr(p, "colors") == Some(name) {
+            let ps = lookup_back(SELECTIVE_RANGES, name)?;
+            let [cyan, magenta, yellow, black] = row.map(f64::from);
             list.push(D::Descriptor(
-                desc("ClrC").with("Clrs", enm("Clrs", ps)).with("Cyn ", pct(v[0])).with("Mgnt", pct(v[1])).with("Yllw", pct(v[2])).with("Blck", pct(v[3])),
+                desc("ClrC")
+                    .with("Clrs", enm("Clrs", ps))
+                    .with("Cyn ", pct(cyan))
+                    .with("Mgnt", pct(magenta))
+                    .with("Yllw", pct(yellow))
+                    .with("Blck", pct(black)),
             ));
         }
     }
-    let mut d = desc("SlcC").with("presetKind", enm("presetKindType", "presetKindCustom"));
-    if let Some(m) = jstr(p, "method") {
-        d = d.with("Mthd", enm("CrcM", if m == "absolute" { "Absl" } else { "Rltv" }));
-    }
-    Some(d.with("ClrC", D::List(list)))
+    Some(
+        desc("SlcC")
+            .with("presetKind", enm("presetKindType", "presetKindCustom"))
+            .with("Mthd", enm("CrcM", if relative { "Rltv" } else { "Absl" }))
+            .with("ClrC", D::List(list)),
+    )
 }
 
 /// Gradient Map: the gradient's colour stops at 0..4096 → `stops: [[0..1, "#rrggbb"], …]`.
@@ -1949,7 +1935,15 @@ fn transform_from(d: &Descriptor) -> Mapped {
     let whole_pixels = ["dx", "dy"].iter().all(|k| p.get(*k).and_then(Value::as_f64).is_none_or(|v| v.fract() == 0.0));
     let geometry_only = p.keys().all(|k| k == "dx" || k == "dy") && whole_pixels;
     // The resampling applies to a selection as much as to a layer (#7515).
-    let interpolation = get_enum(d, "Intr").and_then(|i| lookup(INTERPOLATION, &i)).filter(|i| matches!(*i, "bicubic" | "bilinear" | "nearest"));
+    // Photoshop's bicubic variants are kept (the transforms render them as Bicubic, and they export
+    // back unchanged); Automatic and Preserve Details become the nearest bicubic choice. Dropping
+    // them fell back to the command's default, bilinear for a selection (#8697).
+    let interpolation = get_enum(d, "Intr").and_then(|i| lookup(INTERPOLATION, &i)).and_then(|i| match i {
+        "bicubic" | "bilinear" | "nearest" | "bicubicSharper" | "bicubicSmoother" | "bicubicAutomatic" => Some(i),
+        "automatic" => Some("bicubicAutomatic"),
+        "preserveDetails" => Some("bicubic"),
+        _ => None,
+    });
     match (ref_class(r).as_deref(), target(r)) {
         (Some("Chnl"), Target::Property(prop)) if prop == "fsel" => {
             if let Some(i) = interpolation {
